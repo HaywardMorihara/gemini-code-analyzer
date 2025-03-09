@@ -12,9 +12,25 @@ if [ -z "$GOOGLE_API_KEY" ]; then
   exit 1
 fi
 
+if ! command -v jq &> /dev/null
+then
+  echo "jq could not be found, installing..."
+  if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    sudo apt-get update && sudo apt-get install -y jq
+  elif [[ "$OSTYPE" == "darwin"* ]]; then
+    brew install jq
+  else
+    print_error "Unsupported OS. Please install jq manually."
+    exit 1
+  fi
+fi
+
+CACHE_FILE="/tmp/gemini_cache_id.txt"
+
 TEMP_CONSOLIDATED_CODE_FILE=$(mktemp /tmp/gemini-code-analyzer-context.txt)
 TEMP_REQUEST_FILE=$(mktemp /tmp/cache_request.json)
-trap "rm -f $TEMP_CONSOLIDATED_CODE_FILE $TEMP_REQUEST_FILE" EXIT
+TEMP_CACHE_JSON_RESPONSE=$(mktemp /tmp/cache.json)
+trap "rm -f $TEMP_CONSOLIDATED_CODE_FILE $TEMP_REQUEST_FILE $TEMP_CACHE_JSON_RESPONSE" EXIT
 
 # Finds all the files in the directories & sub-directories and puts them in a single file
 # https://github.com/simonw/files-to-prompt
@@ -69,25 +85,36 @@ cache() {
   curl -X POST "https://generativelanguage.googleapis.com/v1beta/cachedContents?key=$GOOGLE_API_KEY" \
    -H 'Content-Type: application/json' \
    -d @"$TEMP_REQUEST_FILE" \
-   > cache.json
+   > "$TEMP_CACHE_JSON_RESPONSE"
 
-  CACHE_ID=$(grep -o '"name": *"cachedContents/[^"]*' cache.json | sed 's/"name": *"cachedContents\///' | head -n 1)
+  if jq -e '.error' "$TEMP_CACHE_JSON_RESPONSE" > /dev/null; then
+    print_error "Error: $(jq -r '.error.message' "$TEMP_CACHE_JSON_RESPONSE")"
+    exit 1
+  fi
+
+  CACHE_ID=$(jq -r '.name' "$TEMP_CACHE_JSON_RESPONSE" | sed 's/cachedContents\///')
+  echo "$CACHE_ID" > "$CACHE_FILE"
 
   echo "Cache created with ID: $CACHE_ID"
+  echo
   echo "You can start querying using this cache ID as the first argument in the 'ask' command."
-  echo "Example: ./codeai ask $CACHE_ID 'Your query here'"
+  echo "Example: ./codeai ask 'Your query here'"
 }
 
 # Other output options: https://ai.google.dev/gemini-api/docs/text-generation?lang=rest
 ask() {
-  if [ $# -lt 2 ]; then
-    print_error "Error: No cache ID or query message specified."
-    print_error "Usage: $0 ask <CACHE_ID> <QUERY_MESSAGE>"
+  if [ $# -lt 1 ]; then
+    print_error "Error: No query message specified."
+    print_error "Usage: $0 ask <QUERY_MESSAGE>"
     exit 1
   fi
 
-  local CACHE_ID=$1
-  shift
+  if [ ! -f "$CACHE_FILE" ]; then
+    print_error "Error: Cache ID not found. Please run the 'cache' command first."
+    exit 1
+  fi
+
+  local CACHE_ID=$(cat "$CACHE_FILE")
   local QUERY_MESSAGE=$@
 
   echo "Asking your question, this may take a few seconds..."
@@ -106,7 +133,16 @@ ask() {
         "cachedContent": "cachedContents/'"$CACHE_ID"'"
       }')
 
-  echo "$RESPONSE" | grep -o '"text": *"[^"]*' | sed 's/"text": *"//' | sed 's/\\n/\n/g'
+  if echo "$RESPONSE" | grep -q '"code": 403'; then
+    print_error "APIError: $(echo "$RESPONSE" | jq -r '.error.message')"
+    print_error "Error: CachedContent not found (or permission denied). Please make sure you call 'cache' first."
+    exit 1
+  elif echo "$RESPONSE" | jq -e '.error' > /dev/null; then
+    print_error "APIError: $(echo "$RESPONSE" | jq -r '.error.message')"
+    exit 1
+  else
+    echo $RESPONSE | jq -r '.candidates[0].content.parts[0].text'
+  fi
 }
 
 if [ "$1" == "cache" ]; then
