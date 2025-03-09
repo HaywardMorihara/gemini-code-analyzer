@@ -1,8 +1,5 @@
+# Gemini Code Analyzer
 
-```bash
-pip3 install files-to-prompt
-files-to-prompt --version
-
-cd <DIRECTORY>
-files-to-prompt . | llm "What does this code do?"
-````
+Useful Links:
+* https://console.cloud.google.com/apis/api/generativelanguage.googleapis.com/quotas ← Gemini API usage
+* https://ai.google.dev/gemini-api/docs/pricing 

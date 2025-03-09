@@ -1,0 +1,120 @@
+#!/bin/bash
+
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+print_error() {
+  echo -e "${RED}$1${NC}"
+}
+
+if [ -z "$GOOGLE_API_KEY" ]; then
+  print_error "Error: GOOGLE_API_KEY is not set. Please create an API key at https://aistudio.google.com/apikey and set it as an environment variable."
+  exit 1
+fi
+
+TEMP_CONSOLIDATED_CODE_FILE=$(mktemp /tmp/gemini-code-analyzer-context.txt)
+TEMP_REQUEST_FILE=$(mktemp /tmp/cache_request.json)
+trap "rm -f $TEMP_CONSOLIDATED_CODE_FILE $TEMP_REQUEST_FILE" EXIT
+
+# Finds all the files in the directories & sub-directories and puts them in a single file
+# https://github.com/simonw/files-to-prompt
+consolidate_files() {
+  if ! command -v files-to-prompt &> /dev/null
+  then
+    pip3 install files-to-prompt
+  fi
+
+  files-to-prompt "$@" -o "$TEMP_CONSOLIDATED_CODE_FILE"
+}
+
+# https://ai.google.dev/gemini-api/docs/caching?lang=rest
+# https://ai.google.dev/api/caching
+# model - only 1.5 Flash has caching right now -- 2.0 Flash and 2.0 Flash-Lite caching will be available 3/31/2025: https://ai.google.dev/gemini-api/docs/pricing
+# mime_types - https://www.iana.org/assignments/media-types/media-types.xhtml#text
+# systemInstruction - System Prompt
+# ttl - Default is 1 hr
+cache() {
+  if [ $# -lt 1 ]; then
+    print_error "Error: No files/directories specified for caching."
+    print_error "Usage: $0 cache <FILES/DIRECTORIES> [<FILES/DIRECTORIES> ...]"
+    exit 1
+  fi
+
+  consolidate_files "$@"
+  echo '{
+    "model": "models/gemini-1.5-flash-001",
+    "contents":[
+      {
+        "parts":[
+          {
+            "inline_data": {
+              "mime_type":"text/plain",
+              "data": "'$(base64 -i "$TEMP_CONSOLIDATED_CODE_FILE")'"
+            }
+          }
+        ],
+      "role": "user"
+      }
+    ],
+    "systemInstruction": {
+      "parts": [
+        {
+          "text": "You are an expert at analyzing transcripts."
+        }
+      ]
+    },
+    "ttl": "300s"
+  }' > "$TEMP_REQUEST_FILE"
+
+  curl -X POST "https://generativelanguage.googleapis.com/v1beta/cachedContents?key=$GOOGLE_API_KEY" \
+   -H 'Content-Type: application/json' \
+   -d @"$TEMP_REQUEST_FILE" \
+   > cache.json
+
+  CACHE_ID=$(grep -o '"name": *"cachedContents/[^"]*' cache.json | sed 's/"name": *"cachedContents\///' | head -n 1)
+
+  echo "Cache created with ID: $CACHE_ID"
+  echo "You can start querying using this cache ID as the first argument in the 'ask' command."
+  echo "Example: ./codeai ask $CACHE_ID 'Your query here'"
+}
+
+# Other output options: https://ai.google.dev/gemini-api/docs/text-generation?lang=rest
+ask() {
+  if [ $# -lt 2 ]; then
+    print_error "Error: No cache ID or query message specified."
+    print_error "Usage: $0 ask <CACHE_ID> <QUERY_MESSAGE>"
+    exit 1
+  fi
+
+  local CACHE_ID=$1
+  shift
+  local QUERY_MESSAGE=$@
+
+  echo "Asking your question, this may take a few seconds..."
+
+  RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-001:generateContent?key=$GOOGLE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "contents": [
+          {
+            "parts":[{
+              "text": "'"$QUERY_MESSAGE"'"
+            }],
+            "role": "user"
+          }
+        ],
+        "cachedContent": "cachedContents/'"$CACHE_ID"'"
+      }')
+
+  echo "$RESPONSE" | grep -o '"text": *"[^"]*' | sed 's/"text": *"//' | sed 's/\\n/\n/g'
+}
+
+if [ "$1" == "cache" ]; then
+  shift
+  cache "$@"
+elif [ "$1" == "ask" ]; then
+  shift
+  ask "$@"
+else
+  echo "Usage: $0 {cache|ask} ..."
+fi
